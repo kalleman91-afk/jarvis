@@ -182,10 +182,13 @@ INSTEAD SAY:
 
 ACTION SYSTEM:
 When you decide the user needs something DONE (not just discussed), include an action tag in your response:
+- [ACTION:SCREEN] — capture and describe what's visible on the user's screen. Use when user says "look at my screen", "what's running", "what do you see", etc. Do NOT use PROMPT_PROJECT for screen requests.
 - [ACTION:BUILD] description — when user wants a project built. Claude Code does the work.
 - [ACTION:BROWSE] url or search query — when user wants to see a webpage or search result in Chrome
 - [ACTION:RESEARCH] detailed research brief — when user wants real research with real data. Claude Code will browse the web, find real listings/data, and create a report document. Give it a detailed brief of what to find.
 - [ACTION:OPEN_TERMINAL] — when user just wants a fresh Claude Code terminal with no specific project
+CRITICAL: When the user asks about their SCREEN, what's RUNNING, or what they're LOOKING AT — ALWAYS use [ACTION:SCREEN] or let the fast action system handle it. NEVER use [ACTION:PROMPT_PROJECT] for screen requests. PROMPT_PROJECT is ONLY for working on code projects.
+
 - [ACTION:PROMPT_PROJECT] project_name ||| prompt — THIS IS YOUR MOST POWERFUL ACTION. Use it whenever the user wants to work on, jump into, resume, check on, or interact with ANY existing project. You connect directly to Claude Code in that project and can read its response. Craft a clear prompt based on what the user wants. Examples:
   "jump into client engine" → [ACTION:PROMPT_PROJECT] The Client Engine ||| What is the current state of this project? Summarize what was being worked on most recently.
   "check for improvements on my-app" → [ACTION:PROMPT_PROJECT] my-app ||| Review the project and identify improvements we should make.
@@ -227,6 +230,7 @@ ACTIVE TASKS:
 {active_tasks}
 
 DISPATCHES:
+If the DISPATCHES section shows a recent completed result for a project, DO NOT dispatch again. Use the existing result. Only re-dispatch if the user explicitly asks for a FRESH review or NEW information.
 {dispatch_context}
 
 KNOWN PROJECTS:
@@ -734,7 +738,7 @@ def extract_action(response: str) -> tuple[str, dict | None]:
     Returns (clean_text_for_tts, action_dict_or_none).
     """
     match = _action_re.search(
-        r'\[ACTION:(BUILD|BROWSE|RESEARCH|OPEN_TERMINAL|PROMPT_PROJECT|ADD_TASK|ADD_NOTE|COMPLETE_TASK|REMEMBER|CREATE_NOTE|READ_NOTE)\]\s*(.*?)$',
+        r'\[ACTION:(BUILD|BROWSE|RESEARCH|OPEN_TERMINAL|PROMPT_PROJECT|ADD_TASK|ADD_NOTE|COMPLETE_TASK|REMEMBER|CREATE_NOTE|READ_NOTE|SCREEN)\]\s*(.*?)$',
         response, _action_re.DOTALL,
     )
     if match:
@@ -883,7 +887,7 @@ def _find_project_dir(project_name: str) -> str | None:
     return None
 
 
-async def _execute_prompt_project(project_name: str, prompt: str, work_session: WorkSession, ws, dispatch_id: int = None):
+async def _execute_prompt_project(project_name: str, prompt: str, work_session: WorkSession, ws, dispatch_id: int = None, history: list[dict] = None, voice_state: dict = None):
     """Dispatch a prompt to Claude Code in a project directory.
 
     Runs entirely in the background. JARVIS returns to conversation mode
@@ -964,20 +968,28 @@ async def _execute_prompt_project(project_name: str, prompt: str, work_session: 
             else:
                 msg = f"Sir, {project_name} is done. {full_response[:200]}"
 
-        # Speak the result — this interrupts whatever JARVIS is doing
+        # Speak the result — skip if user has spoken recently to avoid audio collision
         log.info(f"Dispatch summary for {project_name}: {msg[:100]}")
-        audio = await synthesize_speech(strip_markdown_for_tts(msg))
-        if ws:
-            try:
-                await ws.send_json({"type": "status", "state": "speaking"})
-                if audio:
-                    await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": msg})
-                    log.info(f"Dispatch audio sent for {project_name}")
-                else:
-                    await ws.send_json({"type": "text", "text": msg})
-                    log.info(f"Dispatch text fallback sent for {project_name}")
-            except Exception as e:
-                log.error(f"Dispatch audio send failed: {e}")
+        if voice_state and time.time() - voice_state["last_user_time"] < 3:
+            log.info(f"Skipping dispatch audio for {project_name} — user spoke recently")
+            # Result is still stored in history below so JARVIS can reference it
+        else:
+            audio = await synthesize_speech(strip_markdown_for_tts(msg))
+            if ws:
+                try:
+                    await ws.send_json({"type": "status", "state": "speaking"})
+                    if audio:
+                        await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": msg})
+                        log.info(f"Dispatch audio sent for {project_name}")
+                    else:
+                        await ws.send_json({"type": "text", "text": msg})
+                        log.info(f"Dispatch text fallback sent for {project_name}")
+                except Exception as e:
+                    log.error(f"Dispatch audio send failed: {e}")
+
+        # Store dispatch result in conversation history so JARVIS remembers it
+        if history is not None:
+            history.append({"role": "assistant", "content": f"[Dispatch result for {project_name}]: {msg}"})
 
         dispatch_registry.update_status(dispatch_id, "completed", response=full_response[:2000], summary=msg[:200])
         log.info(f"Project {project_name} dispatch complete ({len(full_response)} chars)")
@@ -1076,6 +1088,8 @@ async def generate_response(
     task_mgr: ClaudeTaskManager,
     projects: list[dict],
     conversation_history: list[dict],
+    last_response: str = "",
+    session_summary: str = "",
 ) -> str:
     """Generate a JARVIS response using Anthropic API."""
     now = datetime.now()
@@ -1112,8 +1126,17 @@ async def generate_response(
     if memory_ctx:
         system += f"\n\nJARVIS MEMORY:\n{memory_ctx}"
 
-    # Use conversation history directly — caller already appended the user message
-    messages = conversation_history[-10:]
+    # Three-tier memory — inject rolling summary of earlier conversation
+    if session_summary:
+        system += f"\n\nSESSION CONTEXT (earlier in this conversation):\n{session_summary}"
+
+    # Self-awareness — remind JARVIS of last response to avoid repetition
+    if last_response:
+        system += f'\n\nYOUR LAST RESPONSE (do not repeat this):\n"{last_response[:150]}"'
+
+    # Use conversation history — keep the last 20 messages for context
+    # (older conversation is captured in session_summary)
+    messages = conversation_history[-20:]
     # If the last message isn't the current user text, add it
     if not messages or messages[-1].get("content") != text:
         messages = messages + [{"role": "user", "content": text}]
@@ -1439,6 +1462,12 @@ def detect_action_fast(text: str) -> dict | None:
     if len(words) > 12:
         return None  # Long messages are conversation, not commands
 
+    # Screen requests — checked BEFORE project matching to prevent misrouting
+    if any(p in t for p in ["look at my screen", "what's on my screen", "whats on my screen",
+                             "what am i looking at", "what do you see", "see my screen",
+                             "what's running on my", "whats running on my", "check my screen"]):
+        return {"action": "describe_screen"}
+
     # Terminal / Claude Code — explicit open requests
     if any(w in t for w in ["open claude", "start claude", "launch claude", "run claude"]):
         return {"action": "open_terminal"}
@@ -1559,8 +1588,8 @@ async def handle_show_recent() -> str:
 _active_lookups: dict[str, dict] = {}  # id -> {"type": str, "status": str, "started": float}
 
 
-async def _lookup_and_report(lookup_type: str, lookup_fn, ws):
-    """Run a slow lookup in a thread, then speak the result back.
+async def _lookup_and_report(lookup_type: str, lookup_fn, ws, history: list[dict] = None, voice_state: dict = None):
+    """Run a slow lookup, then speak the result back.
 
     JARVIS stays conversational — this runs completely off the main path.
     """
@@ -1572,29 +1601,37 @@ async def _lookup_and_report(lookup_type: str, lookup_fn, ws):
     }
 
     try:
-        # Run the slow function in a thread pool so it never blocks the event loop
-        loop = asyncio.get_event_loop()
+        # Run the async lookup directly — these functions already use
+        # asyncio.create_subprocess_exec so they don't block the event loop
         result_text = await asyncio.wait_for(
-            loop.run_in_executor(None, lambda: asyncio.run(lookup_fn())),
+            lookup_fn(),
             timeout=30,
         )
 
         _active_lookups[lookup_id]["status"] = "done"
 
-        # Speak the result
-        tts = strip_markdown_for_tts(result_text)
-        audio = await synthesize_speech(tts)
-        try:
-            await ws.send_json({"type": "status", "state": "speaking"})
-            if audio:
-                await ws.send_json({"type": "audio", "data": audio, "text": result_text})
-            else:
-                await ws.send_json({"type": "text", "text": result_text})
-            await ws.send_json({"type": "status", "state": "idle"})
-        except Exception:
-            pass
+        # Speak the result — skip audio if user spoke recently to avoid collision
+        if voice_state and time.time() - voice_state["last_user_time"] < 3:
+            log.info(f"Skipping lookup audio for {lookup_type} — user spoke recently")
+            # Result is still stored in history below
+        else:
+            tts = strip_markdown_for_tts(result_text)
+            audio = await synthesize_speech(tts)
+            try:
+                await ws.send_json({"type": "status", "state": "speaking"})
+                if audio:
+                    await ws.send_json({"type": "audio", "data": audio, "text": result_text})
+                else:
+                    await ws.send_json({"type": "text", "text": result_text})
+                await ws.send_json({"type": "status", "state": "idle"})
+            except Exception:
+                pass
 
         log.info(f"Lookup {lookup_type} complete: {result_text[:80]}")
+
+        # Store lookup result in conversation history so JARVIS remembers it
+        if history is not None:
+            history.append({"role": "assistant", "content": f"[{lookup_type} check]: {result_text}"})
 
     except asyncio.TimeoutError:
         _active_lookups[lookup_id]["status"] = "timeout"
@@ -1790,6 +1827,35 @@ blockquote {{ border-left: 3px solid #0ea5e9; margin-left: 0; padding-left: 16px
         return "Pulled up a search for that, sir."
 
 
+# -- Session Summary (Three-Tier Memory) -----------------------------------
+
+async def _update_session_summary(
+    old_summary: str,
+    rotated_messages: list[dict],
+    client: anthropic.AsyncAnthropic,
+) -> str:
+    """Background Haiku call to update the rolling session summary."""
+    prompt = f"""Update this conversation summary to include the new messages.
+
+Current summary: {old_summary or '(start of conversation)'}
+
+New messages to incorporate:
+{chr(10).join(f'{m["role"]}: {m["content"][:200]}' for m in rotated_messages)}
+
+Write an updated summary in 2-4 sentences capturing the key topics, decisions, and context. Be concise."""
+
+    try:
+        response = await client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=200,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return response.content[0].text.strip()
+    except Exception as e:
+        log.warning(f"Summary update failed: {e}")
+        return old_summary  # Keep old summary on failure
+
+
 # -- WebSocket Voice Handler -----------------------------------------------
 
 @app.websocket("/ws/voice")
@@ -1815,6 +1881,18 @@ async def voice_handler(ws: WebSocket):
     # Response cancellation — when new input arrives, cancel current response
     _current_response_id = 0
     _cancel_response = False
+
+    # Audio collision prevention — track when user last spoke
+    voice_state = {"last_user_time": 0.0}
+
+    # Self-awareness — track last spoken response to avoid repetition
+    last_jarvis_response = ""
+
+    # Three-tier conversation memory
+    session_buffer: list[dict] = []  # ALL messages, never truncated
+    session_summary: str = ""  # Rolling summary of older conversation
+    summary_update_pending: bool = False
+    messages_since_last_summary: int = 0
 
     log.info("Voice WebSocket connected")
 
@@ -1890,6 +1968,7 @@ async def voice_handler(ws: WebSocket):
             await asyncio.sleep(0.05)  # Let any pending sends notice the cancellation
             _cancel_response = False
 
+            voice_state["last_user_time"] = time.time()
             log.info(f"User: {user_text}")
             await ws.send_json({"type": "status", "state": "thinking"})
 
@@ -1927,7 +2006,7 @@ async def voice_handler(ws: WebSocket):
                         os.makedirs(path, exist_ok=True)
                         Path(path, "CLAUDE.md").write_text(prompt)
                         did = dispatch_registry.register(name, path, prompt[:200])
-                        asyncio.create_task(_execute_prompt_project(name, prompt, work_session, ws, dispatch_id=did))
+                        asyncio.create_task(_execute_prompt_project(name, prompt, work_session, ws, dispatch_id=did, history=history, voice_state=voice_state))
                         planner.reset()
                         response_text = "Building it now, sir."
                     elif planner.active_plan and planner.active_plan.confirmed is False and planner.active_plan.current_question_index >= len(planner.active_plan.pending_questions):
@@ -1940,7 +2019,7 @@ async def voice_handler(ws: WebSocket):
                             os.makedirs(path, exist_ok=True)
                             Path(path, "CLAUDE.md").write_text(prompt)
                             did = dispatch_registry.register(name, path, prompt[:200])
-                            asyncio.create_task(_execute_prompt_project(name, prompt, work_session, ws, dispatch_id=did))
+                            asyncio.create_task(_execute_prompt_project(name, prompt, work_session, ws, dispatch_id=did, history=history, voice_state=voice_state))
                             planner.reset()
                             response_text = "On it, sir."
                         elif result["cancelled"]:
@@ -1969,6 +2048,8 @@ async def voice_handler(ws: WebSocket):
                         response_text = await generate_response(
                             user_text, anthropic_client, task_manager,
                             cached_projects, history,
+                            last_response=last_jarvis_response,
+                            session_summary=session_summary,
                         )
                     else:
                         # Send to claude -p (full power)
@@ -2034,13 +2115,13 @@ async def voice_handler(ws: WebSocket):
                             response_text = await handle_show_recent()
                         elif action["action"] == "describe_screen":
                             response_text = "Taking a look now, sir."
-                            asyncio.create_task(_lookup_and_report("screen", _do_screen_lookup, ws))
+                            asyncio.create_task(_lookup_and_report("screen", _do_screen_lookup, ws, history=history, voice_state=voice_state))
                         elif action["action"] == "check_calendar":
                             response_text = "Checking your calendar now, sir."
-                            asyncio.create_task(_lookup_and_report("calendar", _do_calendar_lookup, ws))
+                            asyncio.create_task(_lookup_and_report("calendar", _do_calendar_lookup, ws, history=history, voice_state=voice_state))
                         elif action["action"] == "check_mail":
                             response_text = "Checking your inbox now, sir."
-                            asyncio.create_task(_lookup_and_report("mail", _do_mail_lookup, ws))
+                            asyncio.create_task(_lookup_and_report("mail", _do_mail_lookup, ws, history=history, voice_state=voice_state))
                         elif action["action"] == "check_dispatch":
                             recent = dispatch_registry.get_most_recent()
                             if not recent:
@@ -2071,6 +2152,8 @@ async def voice_handler(ws: WebSocket):
                             response_text = await generate_response(
                                 user_text, anthropic_client, task_manager,
                                 cached_projects, history,
+                                last_response=last_jarvis_response,
+                                session_summary=session_summary,
                             )
 
                             # Check for action tags embedded in LLM response
@@ -2117,7 +2200,7 @@ async def voice_handler(ws: WebSocket):
                                     # Register and dispatch
                                     did = dispatch_registry.register(name, path, target)
                                     asyncio.create_task(
-                                        _execute_prompt_project(name, target, work_session, ws, dispatch_id=did)
+                                        _execute_prompt_project(name, target, work_session, ws, dispatch_id=did, history=history, voice_state=voice_state)
                                     )
                                 elif embedded_action["action"] == "browse":
                                     asyncio.create_task(_execute_browse(embedded_action["target"]))
@@ -2136,9 +2219,18 @@ async def voice_handler(ws: WebSocket):
                                     target = embedded_action["target"]
                                     if "|||" in target:
                                         proj_name, _, prompt = target.partition("|||")
-                                        asyncio.create_task(
-                                            _execute_prompt_project(proj_name.strip(), prompt.strip(), work_session, ws)
-                                        )
+                                        proj_name = proj_name.strip()
+                                        prompt = prompt.strip()
+                                        # Check for recent completed dispatch before re-dispatching
+                                        recent = dispatch_registry.get_recent_for_project(proj_name)
+                                        if recent and recent.get("summary"):
+                                            log.info(f"Using recent dispatch result for {proj_name} instead of re-dispatching")
+                                            response_text = recent["summary"]
+                                            history.append({"role": "assistant", "content": f"[Previous dispatch result for {proj_name}]: {recent['summary']}"})
+                                        else:
+                                            asyncio.create_task(
+                                                _execute_prompt_project(proj_name, prompt, work_session, ws, history=history, voice_state=voice_state)
+                                            )
                                     else:
                                         log.warning(f"PROMPT_PROJECT missing ||| delimiter: {target}")
                                 elif embedded_action["action"] == "add_task":
@@ -2177,6 +2269,8 @@ async def voice_handler(ws: WebSocket):
                                         log.info(f"Apple Note created: {title.strip()}")
                                     else:
                                         asyncio.create_task(create_apple_note("JARVIS Note", target))
+                                elif embedded_action["action"] == "screen":
+                                    asyncio.create_task(_lookup_and_report("screen", _do_screen_lookup, ws, history=history, voice_state=voice_state))
                                 elif embedded_action["action"] == "read_note":
                                     # Read note in background and report back
                                     async def _read_and_report(search_term, _ws):
@@ -2198,6 +2292,28 @@ async def voice_handler(ws: WebSocket):
                 history.append({"role": "user", "content": user_text})
                 history.append({"role": "assistant", "content": response_text})
 
+                # Three-tier memory: also track in session buffer
+                session_buffer.append({"role": "user", "content": user_text})
+                session_buffer.append({"role": "assistant", "content": response_text})
+
+                # Check if rolling summary needs updating
+                messages_since_last_summary += 1
+                if messages_since_last_summary >= 5 and len(history) > 20 and not summary_update_pending:
+                    summary_update_pending = True
+                    messages_since_last_summary = 0
+                    # Get messages that are about to be rotated out
+                    rotated = history[:-20] if len(history) > 20 else []
+                    if rotated and anthropic_client:
+                        async def _do_summary():
+                            nonlocal session_summary, summary_update_pending
+                            session_summary = await _update_session_summary(
+                                session_summary, rotated, anthropic_client
+                            )
+                            summary_update_pending = False
+                        asyncio.create_task(_do_summary())
+                    else:
+                        summary_update_pending = False
+
                 # Extract memories in background (doesn't block response)
                 if anthropic_client and len(user_text) > 15:
                     asyncio.create_task(extract_memories(user_text, response_text, anthropic_client))
@@ -2212,6 +2328,7 @@ async def voice_handler(ws: WebSocket):
                     await ws.send_json({"type": "text", "text": response_text})
                     await ws.send_json({"type": "status", "state": "idle"})
                 log.info(f"JARVIS: {response_text}")
+                last_jarvis_response = response_text
 
             except Exception as e:
                 log.error(f"Error: {e}", exc_info=True)
@@ -2341,11 +2458,11 @@ async def api_settings_status():
     _, env_dict = _read_env()
     claude_installed = _shutil.which("claude") is not None
     calendar_ok = mail_ok = notes_ok = False
-    try: get_todays_events(); calendar_ok = True
+    try: await get_todays_events(); calendar_ok = True
     except Exception: pass
-    try: get_unread_count(); mail_ok = True
+    try: await get_unread_count(); mail_ok = True
     except Exception: pass
-    try: get_recent_notes(limit=1); notes_ok = True
+    try: await get_recent_notes(count=1); notes_ok = True
     except Exception: pass
     memory_count = task_count = 0
     try: memory_count = len(get_important_memories(limit=9999))
