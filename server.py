@@ -52,6 +52,7 @@ from memory import (
 from notes_access import get_recent_notes, read_note, search_notes_apple, create_apple_note
 from dispatch_registry import DispatchRegistry
 from planner import TaskPlanner, detect_planning_mode, BYPASS_PHRASES
+import roku_control
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 log = logging.getLogger("jarvis")
@@ -111,6 +112,7 @@ YOUR CAPABILITIES (these are REAL and ACTIVE — you CAN do all of these RIGHT N
 - You CAN manage tasks — create, complete, and list to-do items with priorities and due dates
 - You CAN help plan {user_name}'s day — combine calendar events, tasks, and priorities into an organized plan
 - You CAN remember facts about {user_name} — preferences, decisions, goals. Use [ACTION:REMEMBER] to store important info.
+- You CAN control {user_name}'s Roku TV — launch apps, navigate, change volume, and manage power.
 
 DAY PLANNING:
 When {user_name} asks to plan his day or schedule, DO NOT dispatch to a project. Instead:
@@ -203,6 +205,9 @@ CRITICAL: When the user asks about their SCREEN, what's RUNNING, or what they're
 - [ACTION:CREATE_NOTE] title ||| body — create a new Apple Note. For saving plans, ideas, lists.
   "save that as a note" → [ACTION:CREATE_NOTE] Day Plan March 19 ||| Morning: client calls. Afternoon: TikTok dashboard. Evening: JARVIS improvements.
 - [ACTION:READ_NOTE] title search — read an existing Apple Note by title keyword.
+- [ACTION:ROKU_LAUNCH] app_name — launch a streaming app on the Roku TV (e.g., Netflix, YouTube, Hulu).
+- [ACTION:ROKU_KEY] key_name — send a remote key to the Roku (e.g., Home, Select, Up, Down, Play, VolumeUp, VolumeMute, PowerOff, PowerOn).
+- [ACTION:ROKU_TYPE] text — type a search string into the currently open Roku app.
 
 You use Claude Code as your tool to build, research, and write code — but YOU are the one doing the work. Never say "Claude Code did X" or "Claude Code is asking" — say "I built X", "I'm checking on that", "I found X". You ARE the intelligence. Claude Code is just your hands.
 
@@ -650,14 +655,16 @@ async def classify_intent(text: str, client: anthropic.AsyncAnthropic) -> dict:
                 "- Open Terminal and run Claude Code (coding AI tool)\n"
                 "- Open Chrome browser for web searches and URLs\n"
                 "- Build software projects via Claude Code in Terminal\n"
-                "- Research topics by opening Chrome search\n\n"
+                "- Research topics by opening Chrome search\n"
+                "- Control a Roku TV (launch apps, navigate, volume, power)\n\n"
                 "Note: speech-to-text may produce errors like \"Cloud\" for \"Claude\", "
                 "\"Travis\" for \"JARVIS\", \"clock code\" for \"Claude Code\".\n\n"
-                "Return ONLY valid JSON: {\"action\": \"open_terminal|browse|build|chat\", "
+                "Return ONLY valid JSON: {\"action\": \"open_terminal|browse|build|roku|chat\", "
                 "\"target\": \"description of what to do\"}\n"
                 "open_terminal = user wants to open terminal or launch Claude Code\n"
                 "browse = user wants to search the web, look something up, visit a URL\n"
                 "build = user wants to create/build a software project\n"
+                "roku = user wants to control the TV, launch a streaming app, or change volume\n"
                 "chat = just conversation, questions, or anything else\n"
                 "If unclear, default to \"chat\"."
             ),
@@ -738,7 +745,7 @@ def extract_action(response: str) -> tuple[str, dict | None]:
     Returns (clean_text_for_tts, action_dict_or_none).
     """
     match = _action_re.search(
-        r'\[ACTION:(BUILD|BROWSE|RESEARCH|OPEN_TERMINAL|PROMPT_PROJECT|ADD_TASK|ADD_NOTE|COMPLETE_TASK|REMEMBER|CREATE_NOTE|READ_NOTE|SCREEN)\]\s*(.*?)$',
+        r'\[ACTION:(BUILD|BROWSE|RESEARCH|OPEN_TERMINAL|PROMPT_PROJECT|ADD_TASK|ADD_NOTE|COMPLETE_TASK|REMEMBER|CREATE_NOTE|READ_NOTE|SCREEN|ROKU_LAUNCH|ROKU_KEY|ROKU_TYPE)\]\s*(.*?)$',
         response, _action_re.DOTALL,
     )
     if match:
@@ -2287,6 +2294,48 @@ async def voice_handler(ws: WebSocket):
                                             except Exception:
                                                 pass
                                     asyncio.create_task(_read_and_report(embedded_action["target"].strip(), ws))
+                                elif embedded_action["action"] == "roku_launch":
+                                    # Launch a Roku app in background and speak the confirmation
+                                    async def _roku_launch(app_name: str, _ws):
+                                        result = await roku_control.launch_app(app_name)
+                                        msg = result["confirmation"]
+                                        audio = await synthesize_speech(strip_markdown_for_tts(msg))
+                                        if audio and _ws:
+                                            try:
+                                                await _ws.send_json({"type": "status", "state": "speaking"})
+                                                await _ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": msg})
+                                            except Exception:
+                                                pass
+                                        log.info(f"Roku launch '{app_name}': {msg}")
+                                    asyncio.create_task(_roku_launch(embedded_action["target"].strip(), ws))
+                                elif embedded_action["action"] == "roku_key":
+                                    # Send a Roku keypress in background and speak the confirmation
+                                    async def _roku_key(key_name: str, _ws):
+                                        result = await roku_control.keypress(key_name)
+                                        msg = result["confirmation"]
+                                        audio = await synthesize_speech(strip_markdown_for_tts(msg))
+                                        if audio and _ws:
+                                            try:
+                                                await _ws.send_json({"type": "status", "state": "speaking"})
+                                                await _ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": msg})
+                                            except Exception:
+                                                pass
+                                        log.info(f"Roku key '{key_name}': {msg}")
+                                    asyncio.create_task(_roku_key(embedded_action["target"].strip(), ws))
+                                elif embedded_action["action"] == "roku_type":
+                                    # Type text into the active Roku app in background
+                                    async def _roku_type(text: str, _ws):
+                                        result = await roku_control.send_text(text)
+                                        msg = result["confirmation"]
+                                        audio = await synthesize_speech(strip_markdown_for_tts(msg))
+                                        if audio and _ws:
+                                            try:
+                                                await _ws.send_json({"type": "status", "state": "speaking"})
+                                                await _ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": msg})
+                                            except Exception:
+                                                pass
+                                        log.info(f"Roku type '{text}': {msg}")
+                                    asyncio.create_task(_roku_type(embedded_action["target"].strip(), ws))
 
                 # Update history
                 history.append({"role": "user", "content": user_text})
